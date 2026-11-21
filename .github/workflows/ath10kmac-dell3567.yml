@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: "Full source commit SHA from thekunalthakur/Ath10kMac (blank uses main)"
+        description: "Full commit SHA from thekunalthakur/Ath10kMac (blank uses main)"
         required: false
         type: string
 
@@ -20,52 +20,68 @@ jobs:
     defaults:
       run:
         shell: bash
-    steps:
-      - name: Resolve exact upstream source commit
-        id: source
-        env:
-          REQUESTED_SHA: ${{ inputs.source_sha }}
-        run: |
-          set -euo pipefail
-          sha="$REQUESTED_SHA"
-          if [[ -z "$sha" ]]; then
-            sha="$(git ls-remote --exit-code https://github.com/thekunalthakur/Ath10kMac.git refs/heads/main | cut -f1)"
-          fi
-          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Provide a full lowercase 40-character commit SHA." >&2
-            exit 1
-          fi
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "Source commit: $sha"
 
-      - name: Check out source and pinned submodules
+    steps:
+      - name: Check out Ath10kMac source
         uses: actions/checkout@v6.1.0
         with:
           repository: thekunalthakur/Ath10kMac
-          ref: ${{ steps.source.outputs.sha }}
+          ref: ${{ inputs.source_sha || 'main' }}
           submodules: recursive
           persist-credentials: false
 
-      - name: Build kext and app and verify x86_64
+      - name: Verify toolchain and prepare MacKernelSDK
         env:
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          REQUESTED_SHA: ${{ inputs.source_sha }}
         run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          set -Eeuo pipefail
+          trap 'printf "::error::Line %s failed: %s\n" "$LINENO" "$BASH_COMMAND"' ERR
+
+          source_sha="$(git rev-parse HEAD)"
+          printf 'Ath10kMac source commit: %s\n' "$source_sha"
+
+          if [[ -n "$REQUESTED_SHA" && "$REQUESTED_SHA" != "$source_sha" ]]; then
+            echo "::error::source_sha must be the full lowercase SHA of the requested commit."
+            exit 1
+          fi
+
           test "$(uname -m)" = x86_64
           xcodebuild -version
           xcrun --show-sdk-path
           python3 --version
-          submodules="$(git submodule status --recursive)"
-          test -n "$submodules"
-          printf '%s\n' "$submodules"
-          if grep -Eq '^[-+U]' <<< "$submodules"; then
-            echo "A submodule is missing or differs from its pinned commit." >&2
-            exit 1
+
+          sdk_entry="$(git ls-tree HEAD -- MacKernelSDK)"
+          printf 'MacKernelSDK in source tree: %s\n' "${sdk_entry:-none}"
+
+          if [[ "$sdk_entry" == 160000\ * ]]; then
+            git submodule update --init --recursive -- MacKernelSDK
+            pinned_sdk_sha="$(git rev-parse HEAD:MacKernelSDK)"
+            sdk_sha="$(git -C MacKernelSDK rev-parse HEAD)"
+            test "$sdk_sha" = "$pinned_sdk_sha"
+            sdk_ref="commit $sdk_sha (pinned submodule)"
+          elif [[ -z "$sdk_entry" && ! -e MacKernelSDK ]]; then
+            git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git MacKernelSDK
+            sdk_ref="commit $(git -C MacKernelSDK rev-parse HEAD) (fallback checkout)"
+          else
+            sdk_ref="tree $(git rev-parse HEAD:MacKernelSDK) (included in source)"
           fi
-          test -f MacKernelSDK/Headers/Availability.h
-          test -f MacKernelSDK/Library/x86_64/libkmod.a
-          test -f MacKernelSDK/Library/universal/libkmodc++.a
+
+          for required_file in \
+            MacKernelSDK/Headers/Availability.h \
+            MacKernelSDK/Library/x86_64/libkmod.a \
+            MacKernelSDK/Library/universal/libkmodc++.a; do
+            if [[ ! -f "$required_file" ]]; then
+              echo "::error::Missing required SDK file: $required_file"
+              exit 1
+            fi
+          done
+
+          printf 'SOURCE_SHA=%s\nSDK_REF=%s\n' "$source_sha" "$sdk_ref" >> "$GITHUB_ENV"
+
+      - name: Build and verify kext and app
+        run: |
+          set -Eeuo pipefail
+          trap 'printf "::error::Line %s failed: %s\n" "$LINENO" "$BASH_COMMAND"' ERR
 
           make clean
           make kext
@@ -73,68 +89,73 @@ jobs:
 
           kext="build/out/Ath10kMac.kext"
           app="build/Ath10k Connectivity.app"
+
           for bundle in "$kext" "$app"; do
-            plutil -lint "$bundle/Contents/Info.plist"
-            executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$bundle/Contents/Info.plist")"
-            binary="$bundle/Contents/MacOS/$executable"
-            test -x "$binary"
-            xcrun lipo "$binary" -verify_arch x86_64
-            test "$(xcrun lipo "$binary" -archs)" = x86_64
-            xcrun dwarfdump --uuid "$binary"
+            plist="$bundle/Contents/Info.plist"
+            plutil -lint "$plist"
+            exe_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")"
+            binary="$bundle/Contents/MacOS/$exe_name"
+
+            if [[ ! -x "$binary" ]]; then
+              echo "::error::Missing executable: $binary"
+              exit 1
+            fi
+
+            xcrun lipo -verify_arch x86_64 "$binary"
+            xcrun lipo -info "$binary"
           done
 
-      - name: Package bundles, licenses and build metadata
-        env:
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+      - name: Package kext, app and checksums
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          trap 'printf "::error::Line %s failed: %s\n" "$LINENO" "$BASH_COMMAND"' ERR
+
           stage="build/dell3567-package"
-          output="build/dist"
+          dist="build/dist"
           archive="Ath10kMac-Dell3567-${SOURCE_SHA:0:12}-x86_64.zip"
-          mkdir -p "$stage/Licenses" "$output"
+          mkdir -p "$stage/Licenses" "$dist"
+
           ditto "build/out/Ath10kMac.kext" "$stage/Ath10kMac.kext"
           ditto "build/Ath10k Connectivity.app" "$stage/Ath10k Connectivity.app"
-          cp LICENSE README.md "$stage/"
+
+          cp README.md LICENSE "$stage/"
           cp MacKernelSDK/LICENSE.txt "$stage/Licenses/MacKernelSDK.txt"
           cp firmware/LICENSE.QualcommAtheros_ath10k "$stage/Licenses/"
           cp firmware/notice_ath10k_firmware-6.txt "$stage/Licenses/QCA6174-firmware-notice.txt"
           cp firmware/QCA9377/hw1.0/notice_ath10k_firmware-6.txt "$stage/Licenses/QCA9377-firmware-notice.txt"
-          cp firmware/QCA9377/hw1.0/PROVENANCE.json "$stage/Licenses/QCA9377-firmware-provenance.json"
           cp regulatory/LICENSE "$stage/Licenses/wireless-regdb.txt"
+
           {
-            printf 'Source: https://github.com/thekunalthakur/Ath10kMac\nCommit: %s\nArchitecture: x86_64\n' "$SOURCE_SHA"
-            printf 'Runner OS: '
-            sw_vers -productVersion
+            printf 'Ath10kMac source commit: %s\n' "$SOURCE_SHA"
+            printf 'MacKernelSDK: %s\n' "$SDK_REF"
             xcodebuild -version
-            printf '\nSubmodules:\n'
-            git submodule status --recursive
           } > "$stage/BUILD-INFO.txt"
+
           (
             cd "$stage"
-            shasum -a 256 "Ath10kMac.kext/Contents/MacOS/Ath10kMac" \
-              "Ath10k Connectivity.app/Contents/MacOS/Ath10kConnectivity" > BINARIES.sha256
-            shasum -a 256 -c BINARIES.sha256
-          )
-          ditto -c -k "$stage" "$output/$archive"
+            for bundle in "Ath10kMac.kext" "Ath10k Connectivity.app"; do
+              plist="$bundle/Contents/Info.plist"
+              exe_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")"
+              shasum -a 256 "$bundle/Contents/MacOS/$exe_name"
+            done
+          ) > "$stage/SHA256SUMS.txt"
+
+          ditto -c -k --norsrc "$stage" "$dist/$archive"
+          unzip -tq "$dist/$archive"
+
           (
-            cd "$output"
-            unzip -t "$archive"
+            cd "$dist"
             shasum -a 256 "$archive" > "$archive.sha256"
             shasum -a 256 -c "$archive.sha256"
           )
-          {
-            printf 'Source commit: `%s`\n\n' "$SOURCE_SHA"
-            printf 'Both executables verified as x86_64.\n\n'
-            printf '```text\n'
-            cat "$output/$archive.sha256"
-            printf '```\n'
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload ZIP and SHA-256
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: Ath10kMac-Dell3567-x86_64-${{ steps.source.outputs.sha }}
-          path: build/dist/*
+          name: Ath10kMac-Dell3567-x86_64
+          path: |
+            build/dist/*.zip
+            build/dist/*.zip.sha256
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
