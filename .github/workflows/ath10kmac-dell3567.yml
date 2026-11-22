@@ -82,7 +82,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           trap 'printf "::error::Line %s failed: %s\n" "$LINENO" "$BASH_COMMAND"' ERR
-
+            
           make clean
           make kext
           make app
@@ -101,7 +101,7 @@ jobs:
               exit 1
             fi
 
-            xcrun lipo -verify_arch x86_64 "$binary"
+            xcrun lipo "$binary" -verify_arch x86_64
             xcrun lipo -info "$binary"
           done
 
